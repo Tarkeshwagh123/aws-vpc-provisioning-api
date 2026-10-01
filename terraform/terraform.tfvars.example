@@ -1,0 +1,9 @@
+aws_region  = "us-east-1"
+project_name = "vpc-api"
+
+# Optional: Terraform will create this Cognito user on apply.
+# Copy this file to terraform.tfvars (gitignored) and fill in a password
+# that meets: 12+ chars, upper, lower, number, symbol.
+#
+# demo_user_email    = "demo@example.com"
+# demo_user_password = "ChangeMe_123!"
