@@ -19,3 +19,13 @@ class NotFoundError(ApiError):
 class UpstreamError(ApiError):
     def __init__(self, message, details=None):
         super().__init__(502, message, details)
+
+
+class ForbiddenError(ApiError):
+    def __init__(self, message="You do not have access to this resource"):
+        super().__init__(403, message)
+
+
+class ProvisioningTimeoutError(ApiError):
+    def __init__(self, message, details=None):
+        super().__init__(504, message, details)

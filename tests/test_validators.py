@@ -98,3 +98,26 @@ def test_rejects_too_many_subnets():
             max_subnets=2,
             region=REGION,
         )
+
+
+@pytest.mark.parametrize("vpc_cidr", ["10.0.0.0/8", "10.0.0.0/15", "10.0.0.0/29"])
+def test_rejects_vpc_cidr_outside_aws_range(vpc_cidr):
+    with pytest.raises(ValidationError, match="between /16 and /28"):
+        parse_create_request(
+            {"cidr_block": vpc_cidr, "subnets": [{"cidr_block": "10.0.0.0/29"}]},
+            **DEFAULTS,
+        )
+
+
+@pytest.mark.parametrize("subnet_cidr", ["10.0.0.0/29", "10.0.0.0/32"])
+def test_rejects_subnet_cidr_outside_aws_range(subnet_cidr):
+    with pytest.raises(ValidationError, match="between /16 and /28"):
+        parse_create_request({"subnets": [{"cidr_block": subnet_cidr}]}, **DEFAULTS)
+
+
+def test_accepts_aws_range_boundaries():
+    spec = parse_create_request(
+        {"cidr_block": "10.0.0.0/16", "subnets": [{"cidr_block": "10.0.0.0/28"}]},
+        **DEFAULTS,
+    )
+    assert spec.subnets[0].cidr_block == "10.0.0.0/28"

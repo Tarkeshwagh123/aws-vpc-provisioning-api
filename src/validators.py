@@ -7,6 +7,10 @@ from models import SubnetSpec, VpcSpec
 
 NAME_RE = re.compile(r"^[\w .\-/]{1,255}$")
 
+# AWS accepts IPv4 VPC and subnet CIDRs from /16 to /28.
+MIN_PREFIX = 16
+MAX_PREFIX = 28
+
 
 def parse_create_request(body, *, default_cidr, max_subnets, region) -> VpcSpec:
     data = _as_dict(body)
@@ -105,6 +109,10 @@ def _cidr(value, field_name) -> ipaddress.IPv4Network:
         raise ValidationError(f"{field_name} is not a valid CIDR: {exc}") from exc
     if not isinstance(network, ipaddress.IPv4Network):
         raise ValidationError(f"{field_name} must be IPv4")
+    if not MIN_PREFIX <= network.prefixlen <= MAX_PREFIX:
+        raise ValidationError(
+            f"{field_name} must be between /{MIN_PREFIX} and /{MAX_PREFIX}"
+        )
     return network
 
 

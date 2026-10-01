@@ -1,5 +1,6 @@
 import boto3
-from boto3.dynamodb.conditions import Key
+from boto3.dynamodb.conditions import Attr, Key
+from botocore.exceptions import ClientError
 
 from errors import NotFoundError
 
@@ -19,14 +20,35 @@ class VpcRepository:
         return item
 
     def update(self, record_id, fields):
-        item = self.get(record_id)
-        item.update(fields)
-        self.save(item)
-        return item
+        # A single conditional write: if a DELETE removed the record after we
+        # read it, this fails with 404 instead of writing the record back.
+        names = {f"#f{i}": k for i, k in enumerate(fields)}
+        values = {f":v{i}": v for i, v in enumerate(fields.values())}
+        assignments = ", ".join(f"#f{i} = :v{i}" for i in range(len(fields)))
+        try:
+            resp = self.table.update_item(
+                Key={"id": record_id},
+                UpdateExpression=f"SET {assignments}",
+                ConditionExpression=Attr("id").exists(),
+                ExpressionAttributeNames=names,
+                ExpressionAttributeValues=values,
+                ReturnValues="ALL_NEW",
+            )
+        except ClientError as exc:
+            if _is_condition_failure(exc):
+                raise NotFoundError(f"Record '{record_id}' was not found") from exc
+            raise
+        return resp["Attributes"]
 
     def delete(self, record_id):
-        self.get(record_id)  # 404 if missing
-        self.table.delete_item(Key={"id": record_id})
+        try:
+            self.table.delete_item(
+                Key={"id": record_id}, ConditionExpression=Attr("id").exists()
+            )
+        except ClientError as exc:
+            if _is_condition_failure(exc):
+                raise NotFoundError(f"Record '{record_id}' was not found") from exc
+            raise
 
     def list_all(self, limit=50):
         items = []
@@ -47,6 +69,10 @@ class VpcRepository:
             Limit=min(limit, 100),
         )
         return resp.get("Items", [])[:limit]
+
+
+def _is_condition_failure(exc):
+    return exc.response.get("Error", {}).get("Code") == "ConditionalCheckFailedException"
 
 
 def _drop_none(value):

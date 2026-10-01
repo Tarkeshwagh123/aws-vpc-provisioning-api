@@ -1,3 +1,5 @@
+import base64
+import binascii
 import json
 import logging
 import re
@@ -8,7 +10,7 @@ from urllib.parse import parse_qs
 
 from auth import caller_from_event
 from config import Config
-from errors import ApiError, ValidationError
+from errors import ApiError, ForbiddenError, ValidationError
 from events import EventPublisher
 from repository import VpcRepository
 from responses import error_response, json_response
@@ -26,6 +28,7 @@ def lambda_handler(event, context, deps=None):
     try:
         deps = deps or default_dependencies()
         deps["request_id"] = request_id
+        deps.setdefault("time_left", _time_left(context))
         method, path = _route_key(event)
         _log("info", "request", request_id=request_id, method=method, path=path)
 
@@ -42,7 +45,7 @@ def lambda_handler(event, context, deps=None):
             if method == "PATCH":
                 return _patch_vpc(event, record_id, deps)
             if method == "DELETE":
-                return _delete_vpc(record_id, deps)
+                return _delete_vpc(event, record_id, deps)
 
         return error_response(404, f"No route for {method} {path}", request_id=request_id)
     except ApiError as exc:
@@ -70,6 +73,13 @@ def _request_id(event, context):
     if context is not None and getattr(context, "aws_request_id", None):
         return context.aws_request_id
     return (event.get("requestContext") or {}).get("requestId") or "local"
+
+
+def _time_left(context):
+    remaining = getattr(context, "get_remaining_time_in_millis", None)
+    if remaining is None:
+        return None
+    return lambda: remaining() / 1000
 
 
 def _log(level, msg, **fields):
@@ -102,7 +112,7 @@ def _create_vpc(event, deps):
     )
     caller = caller_from_event(event)
     record_id = deps["new_id"]()
-    aws_result = deps["vpc_service"].create(spec, record_id)
+    aws_result = deps["vpc_service"].create(spec, record_id, time_left=deps.get("time_left"))
 
     record = {
         "id": record_id,
@@ -119,7 +129,7 @@ def _create_vpc(event, deps):
         "created_at": deps["now"](),
         "updated_at": deps["now"](),
     }
-    deps["repo"].save(record)
+    _save_or_roll_back(record, deps)
     deps["events"].publish(
         "VpcCreated",
         {
@@ -132,6 +142,30 @@ def _create_vpc(event, deps):
     )
     _log("info", "vpc_created", request_id=request_id, id=record_id, vpc_id=record["vpc_id"])
     return json_response(201, record, request_id=request_id)
+
+
+def _save_or_roll_back(record, deps):
+    """Without a record the VPC can't be listed or deleted through the API,
+    so a failed save removes the VPC again before the error is returned."""
+    request_id = deps.get("request_id")
+    try:
+        deps["repo"].save(record)
+    except Exception:
+        _log("error", "vpc_record_save_failed", request_id=request_id, id=record["id"],
+             vpc_id=record["vpc_id"], traceback=traceback.format_exc())
+        try:
+            deps["vpc_service"].delete(record["vpc_id"])
+        except Exception:
+            # Left for an operator: the VPC is tagged VpcRecordId=<id>.
+            _log("error", "vpc_rollback_failed", request_id=request_id, id=record["id"],
+                 vpc_id=record["vpc_id"], traceback=traceback.format_exc())
+        raise
+
+
+def _require_owner(event, item):
+    caller = caller_from_event(event)
+    if caller["sub"] == "unknown" or item.get("created_by") != caller["sub"]:
+        raise ForbiddenError("Only the user who created this VPC can change or delete it")
 
 
 def _list_vpcs(event, deps):
@@ -153,7 +187,7 @@ def _list_vpcs(event, deps):
 
 
 def _patch_vpc(event, record_id, deps):
-    deps["repo"].get(record_id)
+    _require_owner(event, deps["repo"].get(record_id))
     updates = parse_vpc_patch(_parse_json_body(event))
     updates["updated_at"] = deps["now"]()
     return json_response(
@@ -161,9 +195,10 @@ def _patch_vpc(event, record_id, deps):
     )
 
 
-def _delete_vpc(record_id, deps):
+def _delete_vpc(event, record_id, deps):
     request_id = deps.get("request_id")
     item = deps["repo"].get(record_id)
+    _require_owner(event, item)
     if item.get("vpc_id"):
         deps["vpc_service"].delete(item["vpc_id"])
     deps["repo"].delete(record_id)
@@ -182,9 +217,10 @@ def _parse_json_body(event):
     if raw in (None, ""):
         return {}
     if event.get("isBase64Encoded"):
-        import base64
-
-        raw = base64.b64decode(raw).decode("utf-8")
+        try:
+            raw = base64.b64decode(raw, validate=True).decode("utf-8")
+        except (binascii.Error, UnicodeDecodeError) as exc:
+            raise ValidationError("Request body is not valid base64-encoded UTF-8") from exc
     if not isinstance(raw, str):
         return raw
     try:

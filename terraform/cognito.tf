@@ -20,8 +20,11 @@ resource "aws_cognito_user_pool" "this" {
     }
   }
 
+  # The client is public (no secret), so open sign-up would let anyone on the
+  # internet get a token and provision VPCs in this account. Users are created
+  # by an admin (scripts/New-DemoUser.ps1 or the demo_user_* variables).
   admin_create_user_config {
-    allow_admin_create_user_only = false
+    allow_admin_create_user_only = true
   }
 }
 

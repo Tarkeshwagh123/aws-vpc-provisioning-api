@@ -2,15 +2,19 @@
 
 Python API on AWS (API Gateway + Lambda). Create a VPC with multiple subnets, save the result in DynamoDB, then retrieve or delete it.
 
-Auth: Cognito. Send `Authorization: Bearer <IdToken>` on every request.
+Auth: Cognito. Send `Authorization: Bearer <IdToken>` on every request. Self sign-up is disabled: users are created by an admin (`scripts/New-DemoUser.ps1` or the `demo_user_*` Terraform variables).
 
 ## Endpoints
 
 - `POST /vpcs` — create VPC + subnets, store the result
 - `GET /vpcs` — list stored records
 - `GET /vpcs/{id}` — get one record
-- `PATCH /vpcs/{id}` — update name / status in DynamoDB
-- `DELETE /vpcs/{id}` — delete the VPC in EC2 and the DB row
+- `PATCH /vpcs/{id}` — update name / status in DynamoDB (creator only, otherwise 403)
+- `DELETE /vpcs/{id}` — delete the VPC in EC2 and the DB row (creator only, otherwise 403)
+
+VPC and subnet CIDRs must be between /16 and /28 (the AWS limits).
+
+A create that gets close to the 29s Lambda timeout (API Gateway gives up at 30s) is rolled back and returns `504`. Nothing is left in EC2, so it is safe to retry, for example with fewer subnets.
 
 ## Deploy
 
@@ -47,6 +51,7 @@ Use the **Id token**, not the access token.
 ## Tests
 
 ```
+pip install -r requirements-dev.txt
 python -m pytest -q
 ```
 

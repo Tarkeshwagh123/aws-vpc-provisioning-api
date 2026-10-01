@@ -1,6 +1,7 @@
+import base64
 import json
 
-from errors import NotFoundError
+from errors import NotFoundError, UpstreamError
 from app import lambda_handler
 
 
@@ -37,7 +38,8 @@ class FakeVpcService:
     def __init__(self):
         self.deleted = []
 
-    def create(self, spec, record_id):
+    def create(self, spec, record_id, time_left=None):
+        self.time_left = time_left
         return {
             "vpc_id": "vpc-123",
             "internet_gateway_id": "igw-123" if spec.has_public_subnets() else None,
@@ -148,7 +150,7 @@ def test_get_missing():
 
 def test_patch_vpc_status():
     repo = FakeRepo()
-    repo.save({"id": "rec-1", "name": "old", "status": "ACTIVE"})
+    repo.save({"id": "rec-1", "name": "old", "status": "ACTIVE", "created_by": "user-1"})
     result = lambda_handler(
         _event("PATCH", "/vpcs/rec-1", {"name": "new", "status": "DISABLED"}),
         FakeContext(),
@@ -164,7 +166,7 @@ def test_delete_vpc_publishes_event():
     repo = FakeRepo()
     svc = FakeVpcService()
     events = FakeEvents()
-    repo.save({"id": "rec-1", "vpc_id": "vpc-123"})
+    repo.save({"id": "rec-1", "vpc_id": "vpc-123", "created_by": "user-1"})
     result = lambda_handler(
         _event("DELETE", "/vpcs/rec-1"), FakeContext(), deps=_deps(repo, svc, events)
     )
@@ -176,3 +178,99 @@ def test_delete_vpc_publishes_event():
 def test_unknown_route():
     result = lambda_handler(_event("GET", "/nope"), FakeContext(), deps=_deps())
     assert result["statusCode"] == 404
+
+
+def _create_body():
+    return {"name": "demo", "subnets": [{"cidr_block": "10.0.1.0/24"}]}
+
+
+def test_delete_by_other_user_is_forbidden():
+    repo = FakeRepo()
+    svc = FakeVpcService()
+    repo.save({"id": "rec-1", "vpc_id": "vpc-123", "created_by": "user-1"})
+    result = lambda_handler(
+        _event("DELETE", "/vpcs/rec-1", sub="user-2"), FakeContext(), deps=_deps(repo, svc)
+    )
+    assert result["statusCode"] == 403
+    assert svc.deleted == []
+    assert "rec-1" in repo.items
+
+
+def test_patch_by_other_user_is_forbidden():
+    repo = FakeRepo()
+    repo.save({"id": "rec-1", "name": "old", "status": "ACTIVE", "created_by": "user-1"})
+    result = lambda_handler(
+        _event("PATCH", "/vpcs/rec-1", {"name": "new"}, sub="user-2"),
+        FakeContext(),
+        deps=_deps(repo),
+    )
+    assert result["statusCode"] == 403
+    assert repo.items["rec-1"]["name"] == "old"
+
+
+def test_save_failure_rolls_back_the_vpc():
+    class FailingRepo(FakeRepo):
+        def save(self, item):
+            raise RuntimeError("dynamodb down")
+
+    svc = FakeVpcService()
+    events = FakeEvents()
+    result = lambda_handler(
+        _event("POST", "/vpcs", _create_body()),
+        FakeContext(),
+        deps=_deps(FailingRepo(), svc, events),
+    )
+    assert result["statusCode"] == 500
+    assert svc.deleted == ["vpc-123"]
+    assert events.calls == []
+
+
+def test_save_failure_still_errors_when_rollback_fails():
+    class FailingRepo(FakeRepo):
+        def save(self, item):
+            raise RuntimeError("dynamodb down")
+
+    class StuckVpcService(FakeVpcService):
+        def delete(self, vpc_id):
+            raise UpstreamError("ec2 down")
+
+    result = lambda_handler(
+        _event("POST", "/vpcs", _create_body()),
+        FakeContext(),
+        deps=_deps(FailingRepo(), StuckVpcService()),
+    )
+    assert result["statusCode"] == 500
+
+
+def test_create_passes_lambda_clock_to_service():
+    class ClockContext(FakeContext):
+        def get_remaining_time_in_millis(self):
+            return 12_000
+
+    svc = FakeVpcService()
+    lambda_handler(_event("POST", "/vpcs", _create_body()), ClockContext(), deps=_deps(vpc_service=svc))
+    assert svc.time_left() == 12.0
+
+
+def test_invalid_base64_body_is_400():
+    event = _event("POST", "/vpcs")
+    event["body"] = "not base64!!"
+    event["isBase64Encoded"] = True
+    result = lambda_handler(event, FakeContext(), deps=_deps())
+    assert result["statusCode"] == 400
+
+
+def test_base64_body_that_is_not_utf8_is_400():
+    event = _event("POST", "/vpcs")
+    event["body"] = base64.b64encode(bytes([0xFF, 0xFE, 0xFD])).decode("ascii")
+    event["isBase64Encoded"] = True
+    result = lambda_handler(event, FakeContext(), deps=_deps())
+    assert result["statusCode"] == 400
+
+
+def test_valid_base64_body_is_accepted():
+    event = _event("POST", "/vpcs")
+    event["body"] = base64.b64encode(json.dumps(_create_body()).encode()).decode("ascii")
+    event["isBase64Encoded"] = True
+    result = lambda_handler(event, FakeContext(), deps=_deps())
+    assert result["statusCode"] == 201

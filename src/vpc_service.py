@@ -4,10 +4,14 @@ from typing import Any
 import boto3
 from botocore.exceptions import ClientError
 
-from errors import UpstreamError
+from errors import ProvisioningTimeoutError, UpstreamError
 from models import CreatedSubnet, SubnetSpec, VpcSpec
 
 logger = logging.getLogger(__name__)
+
+# Stop starting new create steps when less than this is left on the Lambda
+# clock, so rollback can finish before API Gateway (30s) or Lambda gives up.
+MIN_SECONDS_LEFT = 8
 
 
 class VpcService:
@@ -15,8 +19,13 @@ class VpcService:
         self.region = region
         self.project_name = project_name
         self.ec2 = ec2_client or boto3.client("ec2", region_name=region)
+        self._time_left = None
 
-    def create(self, spec: VpcSpec, record_id: str) -> dict[str, Any]:
+    def create(self, spec: VpcSpec, record_id: str, time_left=None) -> dict[str, Any]:
+        """`time_left` returns the seconds left before the request times out;
+        when it gets low the create is rolled back and a 504 is raised, so the
+        client never sees a timeout for a VPC that still gets created."""
+        self._time_left = time_left
         created = {
             "vpc_id": None,
             "subnet_ids": [],
@@ -40,11 +49,16 @@ class VpcService:
             raise
 
     def delete(self, vpc_id: str) -> None:
-        """Tear down subnets / igw / route tables then the VPC itself."""
+        """Tear down subnets / igw / route tables then the VPC itself.
+        A VPC that is already gone counts as deleted, so its record can still
+        be removed."""
         try:
             self._delete_inner(vpc_id)
         except ClientError as exc:
             err = exc.response.get("Error", {})
+            if err.get("Code") == "InvalidVpcID.NotFound":
+                logger.warning("vpc %s already deleted", vpc_id)
+                return
             raise UpstreamError(
                 f"Could not delete {vpc_id}",
                 details={"aws_code": err.get("Code"), "aws_message": err.get("Message")},
@@ -54,26 +68,29 @@ class VpcService:
         azs = self._availability_zones()
         self._assign_azs(spec.subnets, azs)
 
+        self._check_time()
         vpc = self.ec2.create_vpc(
             CidrBlock=spec.cidr_block,
             TagSpecifications=[self._tag_spec("vpc", spec.name, record_id)],
         )
         vpc_id = vpc["Vpc"]["VpcId"]
         created["vpc_id"] = vpc_id
-        self.ec2.get_waiter("vpc_available").wait(VpcIds=[vpc_id])
+        self.ec2.get_waiter("vpc_available").wait(
+            VpcIds=[vpc_id], WaiterConfig={"Delay": 2, "MaxAttempts": 5}
+        )
 
         self.ec2.modify_vpc_attribute(VpcId=vpc_id, EnableDnsSupport={"Value": True})
         self.ec2.modify_vpc_attribute(VpcId=vpc_id, EnableDnsHostnames={"Value": True})
 
-        igw_id = None
-        public_rtb_id = None
         if spec.has_public_subnets():
-            igw_id, public_rtb_id = self._create_public_path(vpc_id, spec.name, record_id)
-            created["igw_id"] = igw_id
-            created["public_rtb_id"] = public_rtb_id
+            self._check_time()
+            self._create_public_path(vpc_id, spec.name, record_id, created)
+        igw_id = created["igw_id"]
+        public_rtb_id = created["public_rtb_id"]
 
         created_subnets = []
         for i, subnet_spec in enumerate(spec.subnets):
+            self._check_time()
             subnet_name = subnet_spec.name or f"{spec.name}-subnet-{i + 1}"
             subnet = self.ec2.create_subnet(
                 VpcId=vpc_id,
@@ -145,11 +162,14 @@ class VpcService:
 
         self.ec2.delete_vpc(VpcId=vpc_id)
 
-    def _create_public_path(self, vpc_id, name, record_id):
+    def _create_public_path(self, vpc_id, name, record_id, created):
+        # Record each ID as soon as it exists, so a failure in a later step
+        # still rolls it back.
         igw = self.ec2.create_internet_gateway(
             TagSpecifications=[self._tag_spec("internet-gateway", f"{name}-igw", record_id)]
         )
         igw_id = igw["InternetGateway"]["InternetGatewayId"]
+        created["igw_id"] = igw_id
         self.ec2.attach_internet_gateway(InternetGatewayId=igw_id, VpcId=vpc_id)
 
         rtb = self.ec2.create_route_table(
@@ -157,12 +177,18 @@ class VpcService:
             TagSpecifications=[self._tag_spec("route-table", f"{name}-public-rtb", record_id)],
         )
         rtb_id = rtb["RouteTable"]["RouteTableId"]
+        created["public_rtb_id"] = rtb_id
         self.ec2.create_route(
             RouteTableId=rtb_id,
             DestinationCidrBlock="0.0.0.0/0",
             GatewayId=igw_id,
         )
-        return igw_id, rtb_id
+
+    def _check_time(self):
+        if self._time_left is not None and self._time_left() < MIN_SECONDS_LEFT:
+            raise ProvisioningTimeoutError(
+                "VPC create ran out of time and was rolled back; nothing was created",
+            )
 
     def _availability_zones(self):
         resp = self.ec2.describe_availability_zones(
